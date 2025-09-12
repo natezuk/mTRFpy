@@ -210,6 +210,8 @@ def nested_crossval(
         `TRF.metric` for all k test sets.
     best_regularization: numpy.ndarray
         Optimal regularization values for all k training sets.
+    pred_test: list
+        List of predicted responses for all k test sets.
     """
     if average is False and not np.isscalar(regularization):
         raise ValueError("Average must be True or a list of indices!")
@@ -274,11 +276,12 @@ def nested_crossval(
             tmax,
             regularization_split_i,
         )
-        _, metric_test[split_i] = model.predict(
+        p, metric_test[split_i] = model.predict(
             [stimulus[i] for i in idx_test], [response[i] for i in idx_test]
         )
+        pred_test.append(p)
         best_regularization.append(regularization_split_i)
-    return metric_test, best_regularization
+    return metric_test, best_regularization, pred_test
 
 
 def _crossval(
