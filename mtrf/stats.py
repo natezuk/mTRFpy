@@ -236,7 +236,9 @@ def nested_crossval(
     n_splits = len(splits)
     metric_test = np.zeros(n_splits)
     best_regularization = []
+    pred_test = list()
     for split_i in range(n_splits):
+        print(f'*** Test on split {split_i} ***')
         idx_test = splits[split_i]
         idx_train_val = np.concatenate(splits[:split_i] + splits[split_i + 1 :])
         if not np.isscalar(regularization):
