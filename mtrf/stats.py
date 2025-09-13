@@ -212,6 +212,8 @@ def nested_crossval(
         Optimal regularization values for all k training sets.
     pred_test: list
         List of predicted responses for all k test sets.
+    model_weights: list
+        List of model weights for each split
     """
     if average is False and not np.isscalar(regularization):
         raise ValueError("Average must be True or a list of indices!")
@@ -237,6 +239,7 @@ def nested_crossval(
     metric_test = np.zeros(n_splits)
     best_regularization = []
     pred_test = list()
+    model_weights = list()
     for split_i in range(n_splits):
         print(f'*** Test on split {split_i} ***')
         idx_test = splits[split_i]
@@ -281,9 +284,11 @@ def nested_crossval(
         p, metric_test[split_i] = model.predict(
             [stimulus[i] for i in idx_test], [response[i] for i in idx_test]
         )
-        pred_test.append(p)
+        pred_test.append(p[0])
         best_regularization.append(regularization_split_i)
-    return metric_test, best_regularization, pred_test
+        model_weights.append(model.weights)
+
+    return metric_test, best_regularization, pred_test, model_weights
 
 
 def _crossval(
