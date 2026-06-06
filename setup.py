@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 import re
 
-with open("README.md") as f:
+with open("README.md", encoding="utf-8") as f:
     readme = f.read()
 
 # extract version
@@ -21,13 +21,15 @@ setup(
     url="http://github.com/powerfulbean/mTRFpy",
     author="powerfulbean",
     license="MIT",
-    python_requires=">=3.8",
-    install_requires=["numpy"],
+    python_requires=">=3.9",
+    install_requires=["numpy", "array-api-compat"],
     extras_require={
         "testing": [
             "requests",
             "flake8",
             "black",
+            "dask",
+            "array-api-strict",
             "pytest",
             "tqdm",
             "matplotlib",

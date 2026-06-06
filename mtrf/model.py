@@ -1,24 +1,36 @@
-from pathlib import Path
-from itertools import product
+from __future__ import annotations
 import pickle
+from pathlib import Path
+from types import ModuleType
+from itertools import product
 from collections.abc import Iterable
+from typing import Literal, Union, List, Tuple
+
 import numpy as np
+
 from mtrf.stats import (
     _crossval,
     _progressbar,
     _check_k,
-    neg_mse,
     pearsonr,
 )
 from mtrf.matrices import (
     covariance_matrices,
     banded_regularization,
     regularization_matrix,
+    fit_weights_with_covariance_matrices,
     lag_matrix,
     truncate,
     _check_data,
+    _check_length,
     _get_xy,
+    Array,
+    ArrayList,
+    lags_idx,
+    is_scalar,
+    is_torch_namespace,
 )
+import array_api_compat
 
 try:
     from matplotlib import pyplot as plt
@@ -34,7 +46,7 @@ class TRF:
     """
     Temporal response function.
 
-    A (multivariate) regression using time lagged input features which can be used as
+    A (multivariable) regression using time lagged input features which can be used as
     an encoding model to predict brain responses from stimulus features or as a decoding
     model to predict stimulus features from brain responses.
 
@@ -74,18 +86,18 @@ class TRF:
 
     def __init__(
         self,
-        direction=1,
-        kind="multi",
-        zeropad=True,
-        method="ridge",
-        preload=True,
-        metric=pearsonr,
+        direction: Literal[1, -1] = 1,
+        kind: Literal["multi", "single"] = "multi",
+        zeropad: bool = True,
+        method: Literal["ridge", "tikhonov", "banded"] = "ridge",
+        preload: bool = True,
+        metric: callable = pearsonr,
     ):
-        self.weights = None
-        self.bias = None
-        self.times = None
-        self.fs = None
-        self.regularization = None
+        self.weights: Array = None
+        self.bias: Array = None
+        self.times: Array = None
+        self.fs: int = None
+        self.regularization: Union[int, float, Array] = None
         if not callable(metric):
             raise ValueError("Metric function must be callable")
         else:
@@ -111,13 +123,13 @@ class TRF:
         else:
             raise ValueError('Method must be either "ridge", "tikhonov" or "banded"!')
 
-    def __radd__(self, trf):
+    def __radd__(self, trf: TRF) -> TRF:
         if trf == 0:
             return self.copy()
         else:
             return self.__add__(trf)
 
-    def __add__(self, trf):
+    def __add__(self, trf: TRF) -> TRF:
         if not isinstance(trf, TRF):
             raise TypeError("Can only add to another TRF instance!")
         if not (self.direction == trf.direction) and (self.kind == trf.kind):
@@ -127,7 +139,7 @@ class TRF:
         trf_new.bias += trf.bias
         return trf_new
 
-    def __truediv__(self, num):
+    def __truediv__(self, num: Union[int, float]) -> TRF:
         trf_new = self.copy()
         trf_new.weights /= num
         trf_new.bias /= num
@@ -135,17 +147,18 @@ class TRF:
 
     def train(
         self,
-        stimulus,
-        response,
-        fs,
-        tmin,
-        tmax,
-        regularization,
-        bands=None,
-        k=-1,
-        average=True,
-        seed=None,
-        verbose=True,
+        stimulus: Union[Array, ArrayList],
+        response: Union[Array, ArrayList],
+        fs: int,
+        tmin: float,
+        tmax: float,
+        regularization: Union[Union[int, float], List[Union[int, float]]],
+        bands: Union[None, List[int]] = None,
+        k: int = -1,
+        average: Union[bool, List[int]] = True,
+        seed: Union[None, int] = None,
+        verbose: bool = True,
+        reg_per_y_channel: bool = False,
     ):
         """
         Optimize the regularization parameter.
@@ -185,7 +198,7 @@ class TRF:
             an envelope vector and a 16-band spectrogram, bands would be [1, 16].
         k: int
             Number of data splits for cross validation, defaults to -1 (leave-one-out).
-        average: bool or list or numpy.ndarray
+        average: True or list or numpy.ndarray
             If True (default), average metric cross all predictions (e.g. channels in the
             case of forward modelling). If `average` is an array of indices only average
             those features.
@@ -193,31 +206,43 @@ class TRF:
             Seed for the random number generator.
         verbose: bool
             If True (default), show a progress bar during fitting.
-
+        reg_per_y_channel: bool
+            If True, fit the best regularization parameter for each channel of y.
+            In this case, average will be forced to be False.
         Returns
         -------
-        metric : list
+        list
             When providing multiple `regularization` values this returns the metric as
             computed by the metric function defined in the `TRF.metric` attribute
             for every regularization value.
         """
         if average is False:
             raise ValueError("Average must be True or a list of indices!")
-        stimulus, response, n_trials = _check_data(stimulus, response)
-        if not np.isscalar(regularization):
+        if reg_per_y_channel:
+            average = False
+        stimulus, xps = _check_data(stimulus)
+        response, xpr = _check_data(response)
+        stimulus, response, n_trials = _check_length(stimulus, response)
+        if not xps == xpr:
+            raise TypeError("stimulus and response trials must be of the same type!")
+        else:
+            xp = xps
+        if not is_scalar(regularization):
             k = _check_k(k, n_trials)
         x, y, tmin, tmax = _get_xy(stimulus, response, tmin, tmax, self.direction)
-        lags = list(range(int(np.floor(tmin * fs)), int(np.ceil(tmax * fs)) + 1))
+        lags = lags_idx(xp, tmin, tmax, fs)
         if self.method == "banded":
             coefficients = list(product(regularization, repeat=len(bands)))
-            regularization = [
-                banded_regularization(len(lags), c, bands) for c in coefficients
-            ]
-        if np.isscalar(regularization):
+            regularization = xp.stack(
+                [banded_regularization(len(lags), c, bands, xp) for c in coefficients],
+                axis=0,
+            )
+        if is_scalar(regularization):
             self._train(x, y, fs, tmin, tmax, regularization)
             return
         else:  # run cross-validation once per regularization parameter
             # pre-compute covariance matrices
+            regularization = xp.asarray(regularization)
             cov_xx, cov_xy = None, None
             if self.preload:
                 cov_xx, cov_xy = covariance_matrices(
@@ -225,7 +250,12 @@ class TRF:
                 )
             else:
                 cov_xx, cov_xy = None, None
-            metric = np.zeros(len(regularization))
+            if reg_per_y_channel:
+                metric = xp.zeros(
+                    (len(regularization), y[0].shape[-1]), dtype=x[0].dtype
+                )
+            else:
+                metric = xp.zeros(len(regularization), dtype=x[0].dtype)
             for ir in _progressbar(
                 range(len(regularization)),
                 "Hyperparameter optimization",
@@ -241,47 +271,95 @@ class TRF:
                     fs,
                     regularization[ir],
                     k,
+                    xp,
                     seed=seed,
                     average=average,
                     verbose=verbose,
                 )
-            best_regularization = list(regularization)[np.argmax(metric)]
+            best_regularization = regularization[xp.argmax(metric, axis=0)]
             self._train(x, y, fs, tmin, tmax, best_regularization)
             return metric
 
-    def _train(self, x, y, fs, tmin, tmax, regularization):
-        if isinstance(regularization, np.ndarray):  # check if matrix is diagonal
-            if (
-                np.count_nonzero(regularization - np.diag(np.diagonal(regularization)))
-                > 0
-            ):
+    def _train(
+        self,
+        x: ArrayList,
+        y: ArrayList,
+        fs: int,
+        tmin: float,
+        tmax: float,
+        regularization: Union[int, float, Array],
+    ):
+        reg_per_y_channel = False
+        xp = array_api_compat.array_namespace(x[0])
+        if not is_scalar(regularization):  # check if matrix is diagonal
+            if regularization.ndim == 2:
+                assert (
+                    xp.count_nonzero(
+                        regularization - xp.diag(xp.diagonal(regularization))
+                    )
+                    == 0
+                ), "Regularization matrix is not diagonal!"
+            elif regularization.ndim == 1:
+                # length of regularization should equals number of channels of y
+                assert (
+                    len(regularization) == y[0].shape[-1]
+                ), "length of regularization should equals number of channels of y"
+                reg_per_y_channel = True
+            else:
                 raise ValueError(
-                    "Regularization parameter must be a single number or a diagonal matrix!"
+                    "if is an array, the regularization should be 1D or 2D only"
                 )
         self.fs, self.regularization = fs, regularization
-        lags = list(range(int(np.floor(tmin * fs)), int(np.ceil(tmax * fs)) + 1))
+        lags = lags_idx(xp, tmin, tmax, fs)
         cov_xx, cov_xy = covariance_matrices(x, y, lags, self.zeropad, preload=False)
-        regmat = regularization_matrix(cov_xx.shape[1], self.method)
-        regmat *= regularization / (1 / self.fs)
-        weight_matrix = np.matmul(np.linalg.inv(cov_xx + regmat), cov_xy) / (
-            1 / self.fs
-        )
+        # regmat = regularization_matrix(cov_xx.shape[1], xp, self.method)
+        # regmat *= regularization / (1 / self.fs)
+        # weight_matrix = xp.linalg.solve((cov_xx + regmat), cov_xy) / (1 / self.fs)
+        weight_matrix = xp.zeros(cov_xy.shape, dtype=x[0].dtype)
+        if reg_per_y_channel:
+            unique_reg_values = xp.unique(regularization)
+            reg_y_chan_dict = {
+                val.item(): (regularization == val).nonzero()[0]
+                for val in unique_reg_values
+            }
+            for t_reg in unique_reg_values:
+                t_chan_idx = reg_y_chan_dict[t_reg.item()]
+                weight_matrix[:, t_chan_idx] = fit_weights_with_covariance_matrices(
+                    cov_xx=cov_xx,
+                    cov_xy=cov_xy[:, t_chan_idx],
+                    fs=self.fs,
+                    regularization=t_reg,
+                    reg_method=self.method,
+                )
+        else:
+            weight_matrix[:] = fit_weights_with_covariance_matrices(
+                cov_xx=cov_xx,
+                cov_xy=cov_xy,
+                fs=self.fs,
+                regularization=regularization,
+                reg_method=self.method,
+            )
+
+        if is_torch_namespace(weight_matrix):
+            weight_matrix = weight_matrix.cpu().numpy()
         self.bias = weight_matrix[0:1]
         if self.bias.ndim == 1:  # add empty dimension for single feature models
-            self.bias = np.expand_dims(self.bias, axis=0)
+            self.bias = xp.expand_dims(self.bias, axis=0)
         self.weights = weight_matrix[1:].reshape(
             (x[0].shape[1], len(lags), y[0].shape[1]), order="F"
         )
-        self.times = np.array(lags) / fs
+        self.times = xp.asarray(lags) / fs
         self.fs = fs
 
     def predict(
         self,
-        stimulus=None,
-        response=None,
-        lag=None,
-        average=True,
-    ):
+        stimulus: Union[None, Array, ArrayList] = None,
+        response: Union[None, Array, ArrayList] = None,
+        lag: Union[None, int, list] = None,
+        average: Union[bool, List[int]] = True,
+    ) -> Union[
+        Union[Array, ArrayList], Tuple[Union[Array, ArrayList]], Union[float, Array]
+    ]:
         """
         Predict response from stimulus (or vice versa) using the trained model.
 
@@ -291,28 +369,28 @@ class TRF:
 
         Parameters
         ----------
-        stimulus: None or list or numpy.ndarray
+        stimulus: None or array-like or list of array-like
             Either a 2-D samples-by-features array, if the data contains only one trial
             or a list of such arrays of it contains multiple trials. The second
             dimension can be omitted if there only is a single stimulus feature
             (e.g. envelope). When using a forward model, this must be specified.
-        response: None or list or numpy.ndarray
+        response: None or array-like or list of array-like
             Either a 2-D samples-by-channels array, if the data contains only one
             trial or a list of such arrays of it contains multiple trials. Must be
             provided when using a backward model.
-        lag: None or in or list
+        lag: None or int or list of int
             If not None (default), only use the specified lags for prediction.
             The provided values index the elements in self.times.
-        average: bool or list or numpy.ndarray
+        average: bool or int or list of int
             If True (default), average metric across all predicted features (e.g. channels
             in the case of forward modelling). If `average` is an array of indices only
             average those features. If `False`, return each predicted feature's metric.
 
         Returns
         -------
-        prediction: numpy.ndarray
-            Predicted stimulus or response
-        metric: float or numpy.ndarray
+        array-like or list of array-like
+            Predicted stimulus or response.
+        float or array-like
             If both stimulus and response are provided, metric is computed by the
             metric function defined in the attribute `TRF.metric`.
             If average is False, an array containing the metric for each feature
@@ -325,30 +403,46 @@ class TRF:
             raise ValueError("Need stimulus to predict with a forward model!")
         elif self.direction == -1 and response is None:
             raise ValueError("Need response to predict with a backward model!")
-        else:
-            stimulus, response, n_trials = _check_data(stimulus, response)
         if stimulus is None:
-            stimulus = [None for _ in range(n_trials)]
+            stimulus = [None for _ in range(len(response))]
+        else:
+            stimulus, xps = _check_data(stimulus)
+            xp = xps
         if response is None:
-            response = [None for _ in range(n_trials)]
-
-        x, y = _get_xy(stimulus, response, direction=self.direction)
-        prediction = [np.zeros((x_i.shape[0], self.weights.shape[-1])) for x_i in x]
-        metric = []
-        for i, (x_i, y_i) in enumerate(zip(x, y)):
-            lags = list(
-                range(
-                    int(np.floor(self.times[0] * self.fs)),
-                    int(np.ceil(self.times[-1] * self.fs)) + 1,
+            response = [None for _ in range(len(stimulus))]
+        else:
+            response, xpr = _check_data(response)
+            xp = xpr
+        if stimulus[0] is not None and response[0] is not None:
+            stimulus, response, _ = _check_length(stimulus, response)
+            if not xps == xpr:
+                raise TypeError(
+                    "stimulus and response trials must be of the same type!"
                 )
-            )
+        x, y, _, _ = _get_xy(
+            stimulus,
+            response,
+            tmin=self.times[0],
+            tmax=self.times[-1],
+            direction=self.direction,
+        )
+        prediction = [
+            xp.zeros((x_i.shape[0], self.weights.shape[-1]), dtype=x_i.dtype)
+            for x_i in x
+        ]
+        if y[0] is not None:
+            metric = xp.zeros((len(x), self.weights.shape[-1]), dtype=x[0].dtype)
+        for i, (x_i, y_i) in enumerate(zip(x, y)):
+            times = xp.asarray(self.times)
+            lags = lags_idx(xp, times[0], times[-1], self.fs)
             w = self.weights.copy()
+            xp_w = array_api_compat.get_namespace(w)
             if lag is not None:  # select lag and corresponding weights
                 if not isinstance(lag, Iterable):
                     lag = [lag]
-                lags = list(np.array(lags)[lag])
+                lags = list(xp.array(lags)[lag])
                 w = w[:, lag, :]
-            w = np.concatenate(
+            w = xp_w.concat(
                 [
                     self.bias,
                     w.reshape(
@@ -356,19 +450,20 @@ class TRF:
                     ),
                 ]
             ) * (1 / self.fs)
+            w = xp.asarray(w)
             x_lag = lag_matrix(x_i, lags, self.zeropad)
             y_pred = x_lag @ w
             if y_i is not None:
                 if self.zeropad is False:
                     y_i = truncate(y_i, lags[0], lags[-1])
-                metric.append(self.metric(y_i, y_pred))
+                metric[i, :] = self.metric(y_i, y_pred)
             prediction[i][:] = y_pred
         if y[0] is not None:
-            metric = np.mean(metric, axis=0)  # average across trials
-            if isinstance(average, list) or isinstance(average, np.ndarray):
+            metric = xp.mean(metric, axis=0)  # average across trials
+            if hasattr(average, "__len__"):
                 metric = metric[average]  # select a subset of predictions
             if average is not False:
-                metric = np.mean(metric)
+                metric = xp.mean(metric)
             return prediction, metric
         else:
             return prediction
@@ -389,28 +484,28 @@ class TRF:
 
         Returns
         -------
-        trf: model.TRF
+        TRF
             New TRF instance with the transformed forward weights
         """
-        assert self.direction == -1
+        assert self.direction == -1, "This method only works for backward models!"
 
-        _, response, n_trials = _check_data(None, response)
-        stim_pred = self.predict(response=response)
-
-        Cxx = 0
-        Css = 0
+        response, xp = _check_data(response)
+        stimulus = self.predict(response=response)
+        n_trials = len(response)
+        cov_xx = 0
+        cov_yy = 0
         trf = self.copy()
-        trf.times = np.asarray([-i for i in reversed(trf.times)])
+        trf.times = xp.asarray([-i for i in reversed(trf.times)])
         trf.direction = 1
         for i in range(n_trials):
-            Cxx = Cxx + response[i].T @ response[i]
-            Css = Css + stim_pred[i].T @ stim_pred[i]
-        nStimChan = trf.weights.shape[-1]
-        for i in range(nStimChan):
-            trf.weights[..., i] = Cxx @ self.weights[..., i] / Css[i, i]
+            cov_xx = cov_xx + response[i].T @ response[i]
+            cov_yy = cov_yy + stimulus[i].T @ stimulus[i]
+        n_channels = trf.weights.shape[-1]
+        for i in range(n_channels):
+            trf.weights[..., i] = cov_xx @ self.weights[..., i] / cov_yy[i, i]
 
-        trf.weights = np.flip(trf.weights.T, axis=1)
-        trf.bias = np.zeros(trf.weights.shape[-1])
+        trf.weights = xp.flip(trf.weights.T, axis=1)
+        trf.bias = xp.zeros(trf.weights.shape[-1], dtype=trf.weights.dtype)
         return trf
 
     def save(self, path):
@@ -475,6 +570,7 @@ class TRF:
         Returns:
             fig (matplotlib.figure.Figure): If now axes was provided and a new figure is created, it is returned.
         """
+        xp = array_api_compat.array_namespace(self.weights)
         if plt is None:
             raise ModuleNotFoundError("Need matplotlib to plot TRF!")
         if self.direction == -1:
@@ -494,6 +590,7 @@ class TRF:
             channel = 0
         if channel is None and feature is None:
             raise ValueError("You must specify a subset of channels or features!")
+        image_ylabel = ""
         if feature is not None:
             image_ylabel = "channel"
             if isinstance(feature, int):
@@ -533,7 +630,7 @@ class TRF:
                 aspect="auto",
                 extent=[0, weights.shape[0], 0, weights.shape[1]],
             )
-            extent = np.asarray(im.get_extent(), dtype=float)
+            extent = xp.asarray(im.get_extent(), dtype=float)
             extent[:2] *= scale
             im.set_extent(extent)
             ax.set(
@@ -571,6 +668,7 @@ class TRF:
         evokeds: list
             One Evoked instance for each included TRF feature.
         """
+        xp = array_api_compat.array_namespace(self.weights)
         if mne is False:
             raise ModuleNotFoundError("To use this function, mne must be installed!")
         if self.direction == -1:
@@ -593,7 +691,7 @@ class TRF:
         else:
             raise ValueError
         if isinstance(include, list) or isinstance(include, np.ndarray):
-            weights = weights[np.asarray(include), :, :]
+            weights = weights[xp.asarray(include), :, :]
         evokeds = []
         for w in weights:
             evoked = mne.EvokedArray(w.T.copy(), mne_info, tmin=self.times[0], **kwargs)
@@ -603,7 +701,9 @@ class TRF:
         return evokeds
 
 
-def load_sample_data(path=None, n_segments=1, normalize=True):
+def load_sample_data(
+    path: Union[None, str, Path] = None, n_segments: int = 1, normalize: bool = True
+) -> Tuple[ArrayList, ArrayList, int]:
     """
     Load sample of brain responses to naturalistic speech.
 
@@ -619,6 +719,12 @@ def load_sample_data(path=None, n_segments=1, normalize=True):
         Destination where the sample data is stored or will be downloaded to. If None
         (default), a folder called mtrf_data in the users home directory is assumed
         and created if it does not exist.
+
+    n_segments: int
+        Number of segments (i.e. trials) the data are divided into.
+
+    normalize: bool
+        If True (default) subtract the mean and divide by the standard deviation.
 
     Returns
     -------
@@ -650,11 +756,7 @@ def load_sample_data(path=None, n_segments=1, normalize=True):
     stimulus = np.array_split(stimulus, n_segments)
     response = np.array_split(response, n_segments)
     if normalize:
-        for i in range(len(stimulus)):
-            stimulus[i] = (stimulus[i] - stimulus[i].mean(axis=0)) / stimulus[i].std(
-                axis=0
-            )
-            response[i] = (response[i] - response[i].mean(axis=0)) / response[i].std(
-                axis=0
-            )
+        for i, (s, r) in enumerate(zip(stimulus, response)):
+            stimulus[i] = (s - s.mean(axis=0)) / s.std(axis=0)
+            response[i] = (r - r.mean(axis=0)) / r.std(axis=0)
     return stimulus, response, fs
